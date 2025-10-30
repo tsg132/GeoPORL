@@ -8,6 +8,8 @@
 
 #include <string>
 
+#include <random>
+
 
 struct ReplayStep {
     int episode_id;
@@ -38,4 +40,34 @@ class ReplayBuffer {
 
         std::vector<ReplayStep> steps_;
 
-};  // Ask about the construction of ReplayBuffer
+};
+
+namespace geoporl::rl {
+
+struct Transition {
+    State s;
+    int   action;
+    double reward;
+    State s_next;
+    bool  done;
+};
+
+class ReplayBuffer {
+public:
+    explicit ReplayBuffer(size_t capacity);
+
+    void add(const State& s, int action, double reward, const State& s_next, bool done);
+
+    std::vector<size_t> sample_indices(size_t batch, std::mt19937_64& rng) const;
+
+    const Transition& operator[](size_t i) const;
+    size_t size() const;
+    bool   full() const;
+
+private:
+    size_t cap_;
+    size_t pos_ = 0;
+    std::vector<Transition> buf_;
+};
+
+} // namespace geoporl::rl

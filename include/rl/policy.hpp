@@ -47,7 +47,7 @@ class Policy {
 
     void update(const float* h_X, const int* h_A, const float* h_Adv, int B);
 
-    void act(const float* h_state, bool stochastic=true);
+    int act(const float* h_state, bool stochastic=true);
 
     void get_weights(std::vector<float>& h_W) const;
 

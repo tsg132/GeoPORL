@@ -38,7 +38,7 @@ Forward pass:
 
 namespace rl {
 
-static cublasHandle_t g_blasl
+static cublasHandle_t g_blas;
 
 __global__ void softmax_rowwise(float* logits, float* probs, int B, int A) {
 
@@ -89,7 +89,7 @@ __global__ void probs_minus_onehot_scaled(float* probs, const int* A_idx, const 
 
     float scale = -Adv[b];
 
-    probs[idx] = g * scale
+    probs[idx] = g * scale;
 
 }
 
@@ -186,10 +186,122 @@ void Policy::forward(const float* h_X, int B,
 
     int blocks = (B + threads - 1) / threads;
 
-    softmax_rowwise<<<blocks, threads>>>(d_logits_, d_probs_, B, cfg_num_actions);
+    softmax_rowwise<<<blocks, threads>>>(d_logits_, d_probs_, B, cfg_.num_actions);
 
     CUDA_OK(cudaPeekAtLastError());
-    
+
+    h_logits.resize(size_t(B) * cfg_.num_actions);
+
+    h_probs.resize(size_t(B) * cfg_.num_actions);
+
+    CUDA_OK(cudaMemcpy(h_logits.data(), d_logits_, sizeof(float) * h_logits.size(), cudaMemcpyDeviceToHost));
+
+    CUDA_OK(cudaMemcpy(h_probs.data(), d_probs_, sizeof(float) * h_probs.size(), cudaMemcpyDeviceToHost));
 }  
+
+void Policy::update(const float * h_X, const int* h_A, const float* h_Adv, int B)
+{
+
+
+    ensure_capacity(B);
+
+    CUDA_OK(cudaMemcpy(d_X_, h_X, sizeof(float) * B * cfg_.state_dim, cudaMemcpyHostToDevice));
+
+    const float alpha1 = 1.0f, beta0 = 0.0f;
+
+        CUBLAS_OK(cublasSgemm(g_blas, CUBLAS_OP_N, CUBLAS_OP_N,
+        cfg_.num_actions, B, cfg_.state_dim,
+        &alpha1, d_W_, cfg_.num_actions, d_X_, cfg_.state_dim, &beta0, d_logits_, cfg_.num_actions));
+
+    
+    int t = 256, b = (B + t - 1) / t;
+    softmax_rowwise<<<b, t>>>(d_logits_, d_probs_, B, cfg_.num_actions);
+    CUDA_OK(cudaPeekAtLastError());
+
+
+    int* d_A; float* d_Adv;
+    CUDA_OK(cudaMalloc(&d_A,   sizeof(int) * B));
+    CUDA_OK(cudaMalloc(&d_Adv, sizeof(float) * B));
+    CUDA_OK(cudaMemcpy(d_A,   h_A,   sizeof(int) * B,   cudaMemcpyHostToDevice));
+    CUDA_OK(cudaMemcpy(d_Adv, h_Adv, sizeof(float) * B, cudaMemcpyHostToDevice));
+
+        int BA = B * cfg_.num_actions;
+    int tb = 256, bb = (BA + tb - 1) / tb;
+    probs_minus_onehot_scaled<<<bb, tb>>>(d_probs_, d_A, d_Adv, B, cfg_.num_actions);
+    CUDA_OK(cudaPeekAtLastError());
+    cudaFree(d_A); cudaFree(d_Adv);
+
+    const float alpha = 1.0f / std::max(1, B);
+    const float beta  = 0.0f;
+    zero_grad();
+    CUBLAS_OK(cublasSgemm(g_blas, CUBLAS_OP_T, CUBLAS_OP_N,
+        cfg_.state_dim, cfg_.num_actions, B,
+        &alpha,
+        d_X_,     cfg_.state_dim,
+        d_probs_, cfg_.num_actions,
+        &beta,
+        d_gradW_, cfg_.state_dim));
+
+    int N = cfg_.state_dim * cfg_.num_actions;
+    int t2 = 256, b2 = (N + t2 - 1) / t2;
+    if (cfg_.l2 > 0.f)
+        l2_add<<<b2, t2>>>(d_gradW_, d_W_, cfg_.l2, N);
+
+    sgd<<<b2, t2>>>(d_W_, d_gradW_, cfg_.lr, N);
+    CUDA_OK(cudaPeekAtLastError());
+}
+
+int Policy::act(const float* h_state, bool stochastic)
+
+{
+
+    std::vector<float> logits, probs;
+
+    forward(h_state, 1, logits, probs);
+
+    int A = cfg_.num_actions;
+
+    if (!stochastic) {
+
+        int argmax = 0;
+
+        float best = probs[0];
+
+        for (int a = 1; a < A; ++a) {
+
+            if (probs[a] > best) { best = probs[a]; argmax = a;}
+
+        }
+
+        return argmax;
+    }
+
+    float u = float(rand()) / RAND_MAX;
+
+    float c = 0.f;
+
+    for (int a = 0; a < A; ++a) { 
+
+        c += probs[a];
+
+        if (u <= c) return a;
+
+    }
+
+    return A - 1;
+
+}
+
+void Policy::get_weights(std::vector<float>& h_W) const {
+    h_W.resize(size_t(cfg_.state_dim) * cfg_.num_actions);
+    CUDA_OK(cudaMemcpy(h_W.data(), d_W_, sizeof(float) * h_W.size(), cudaMemcpyDeviceToHost));
+}
+
+void Policy::set_weights(const std::vector<float>& h_W) {
+    if ((int)h_W.size() != cfg_.state_dim * cfg_.num_actions)
+        throw std::runtime_error("set_weights: size mismatch");
+    CUDA_OK(cudaMemcpy(d_W_, h_W.data(), sizeof(float) * h_W.size(), cudaMemcpyHostToDevice));
+}
+
 
 }

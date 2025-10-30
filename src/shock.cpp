@@ -5,118 +5,130 @@
 
 namespace {
 
-// clamp helper
 inline double clamp01(double x) {
     return std::clamp(x, 0.0, 1.0);
 }
 
-// Gradual recovery
-inline void decay_severity(float& sev) {
-    sev = std::max(0.0f, sev - 0.05f);
+// Maps state variables to risk contribution in [0,1]
+double risk_factor(const State& s, ShockType type) {
+    switch (type) {
+        case ShockType::Disaster:
+            return s.disaster_vulnerability;
+        case ShockType::Coup:
+            return 0.5*(1.0 - s.democracy) + 0.5*s.polarization;
+        case ShockType::Sanction:
+            return s.sanction_risk;
+        case ShockType::Techboom:
+            return s.rnd_investment * s.tech_adoption;
+        case ShockType::Pandemic:
+            return (1.0 - s.healthcare);
+        case ShockType::Escalation:
+            return s.external_threat;
+        default:
+            return 0.0;
+    }
 }
 
-// Scalar shock impact utility
-inline void apply_scalar(double& target, float sev, double magnitude, bool positive) {
-    if (positive)
-        target = clamp01(target + sev * magnitude);
-    else
-        target = clamp01(target - sev * magnitude);
+// Helper: Beta(α,β) via two Gammas
+inline float sample_beta(double a, double b, std::mt19937_64& rng) {
+    std::gamma_distribution<double> ga(a, 1.0);
+    std::gamma_distribution<double> gb(b, 1.0);
+    double x = ga(rng);
+    double y = gb(rng);
+    return float(x / (x + y));
 }
 
 } // anonymous namespace
 
 namespace geoporl {
 
-// ===========================
-// Shock: Effects on the State
-// ===========================
-void apply_shock_effects(State& s) {
-    const float sev = clamp01(s.shock_severity);
-    if (sev <= 0.001f || s.shock_type == 0)
-        return;
-
-    switch (static_cast<ShockType>(s.shock_type)) {
-
-    case ShockType::Disaster:
-        apply_scalar(s.gdp_pc, sev, 0.05, false);
-        apply_scalar(s.cohesion, sev, 0.05, false);
-        apply_scalar(s.disaster_vulnerability, sev, 0.03, true);
-        apply_scalar(s.food_security, sev, 0.06, false);
-        apply_scalar(s.water_scarcity, sev, 0.04, true);
-        break;
-
-    case ShockType::Coup:
-        apply_scalar(s.democracy, sev, 0.08, false);
-        apply_scalar(s.state_capacity, sev, 0.06, false);
-        apply_scalar(s.polarization, sev, 0.05, true);
-        apply_scalar(s.internal_conflict_risk, sev, 0.06, true);
-        break;
-
-    case ShockType::Sanction:
-        apply_scalar(s.trade_openness, sev, 0.05, false);
-        apply_scalar(s.gdp_pc, sev, 0.04, false);
-        apply_scalar(s.foreign_direct_investment, sev, 0.07, false);
-        apply_scalar(s.sanction_risk, sev, 0.05, true);
-        break;
-
-    case ShockType::Techbook:
-        apply_scalar(s.rnd_investment, sev, 0.05, true);
-        apply_scalar(s.tech_adoption, sev, 0.04, true);
-        apply_scalar(s.patent_output, sev, 0.05, true);
-        break;
-
-    case ShockType::Pandemic:
-        apply_scalar(s.healthcare, sev, 0.07, false);
-        apply_scalar(s.life_expectancy, sev, 0.07, false);
-        apply_scalar(s.education, sev, 0.04, false);
-        apply_scalar(s.internal_conflict_risk, sev, 0.05, true);
-        break;
-
-    case ShockType::Escalation:
-        apply_scalar(s.military_spend, sev, 0.06, true);
-        apply_scalar(s.external_threat, sev, 0.06, true);
-        apply_scalar(s.internal_conflict_risk, sev, 0.04, true);
-        apply_scalar(s.gdp_pc, sev, 0.05, false);
-        break;
-
-    default:
-        break;
+void init_shock_params(ShockParams& p) {
+    for (int i = 0; i < 6; i++) {
+        p.lambda[i] = 0.02;  // lower base event rate
+        p.alpha[i]  = 2.0;   // mild shocks commonly
+        p.beta[i]   = 6.0;   // but large shocks still possible
     }
-
-    decay_severity(s.shock_severity);
 }
 
-// ===========================
-// Shock Sampling (Risk-based)
-// ===========================
-Shock sample_shock(const State& s, std::mt19937_64& rng) {
-    std::uniform_real_distribution<double> u(0.0, 1.0);
-    double roll = u(rng);
+// Weighted sampling based on risk
+Shock sample_shock(const State& s,
+                   const ShockParams& params,
+                   std::mt19937_64& rng)
+{
+    std::uniform_real_distribution<double> U(0.0, 1.0);
 
-    // Probabilities proportional to risk signals
-    double p_disaster    = s.disaster_vulnerability * 0.15;
-    double p_coup        = s.polarization * 0.10;
-    double p_sanction    = s.sanction_risk * 0.08;
-    double p_techboom    = s.rnd_investment * s.tech_adoption * 0.05;
-    double p_pandemic    = (1.0 - s.healthcare) * 0.12;
-    double p_escalation  = s.external_threat * 0.10;
+    double P[6];
+    double p_total = 0.0;
 
-    double p_total = p_disaster + p_coup + p_sanction +
-                     p_techboom + p_pandemic + p_escalation;
+    for (int k = 0; k < 6; k++) {
+        double rf = clamp01(
+            risk_factor(s, static_cast<ShockType>(k+1))
+        );
+        P[k] = params.lambda[k] * rf;
+        p_total += P[k];
+    }
 
-    if (roll > p_total)
+    if (U(rng) > p_total)
         return {ShockType::None, 0.0f, {}};
 
     // Weighted selection
-    double r = roll * p_total;
+    double r = U(rng) * p_total;
+    for (int k = 0; k < 6; k++) {
+        if (r < P[k]) {
+            ShockType type = static_cast<ShockType>(k+1);
+            float sev = sample_beta(params.alpha[k], params.beta[k], rng);
+            return {type, sev, {}};
+        }
+        r -= P[k];
+    }
 
-    if ((r -= p_disaster) <= 0)   return {ShockType::Disaster,   float(u(rng)), {}};
-    if ((r -= p_coup) <= 0)       return {ShockType::Coup,       float(u(rng)), {}};
-    if ((r -= p_sanction) <= 0)   return {ShockType::Sanction,   float(u(rng)), {}};
-    if ((r -= p_techboom) <= 0)   return {ShockType::Techbook,   float(u(rng)), {}};
-    if ((r -= p_pandemic) <= 0)   return {ShockType::Pandemic,   float(u(rng)), {}};
+    return {ShockType::None, 0.0f, {}};
+}
 
-    return {ShockType::Escalation, float(u(rng)), {}};
+// Minimal — updated as needed later
+void apply_shock_effects(State& s) {
+    if (s.shock_type == 0 || s.shock_severity <= 0.0f)
+        return;
+
+    float sev = s.shock_severity;
+
+    switch (static_cast<ShockType>(s.shock_type)) {
+    case ShockType::Disaster:
+        s.gdp_pc                *= (1.0 - 0.02 * sev);
+        s.cohesion              *= (1.0 - 0.03 * sev);
+        s.food_security         *= (1.0 - 0.03 * sev);
+        break;
+
+    case ShockType::Coup:
+        s.democracy             *= (1.0 - 0.04 * sev);
+        s.state_capacity        *= (1.0 - 0.03 * sev);
+        break;
+
+    case ShockType::Sanction:
+        s.trade_openness        *= (1.0 - 0.03 * sev);
+        s.gdp_pc                *= (1.0 - 0.02 * sev);
+        break;
+
+    case ShockType::Techboom:
+        s.rnd_investment        *= (1.0 + 0.02 * sev);
+        s.tech_adoption         *= (1.0 + 0.01 * sev);
+        break;
+
+    case ShockType::Pandemic:
+        s.healthcare            *= (1.0 - 0.03 * sev);
+        s.life_expectancy       *= (1.0 - 0.03 * sev);
+        break;
+
+    case ShockType::Escalation:
+        s.military_spend        *= (1.0 + 0.03 * sev);
+        s.external_threat       *= (1.0 + 0.03 * sev);
+        break;
+
+    default: break;
+    }
+
+    // Decay shock next step
+    s.shock_severity = std::max(0.0f, s.shock_severity - 0.05f);
 }
 
 } // namespace geoporl

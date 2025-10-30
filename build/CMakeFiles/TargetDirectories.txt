@@ -1,0 +1,3 @@
+/Users/tsg/Desktop/project/GeoPORL/build/CMakeFiles/run_example.dir
+/Users/tsg/Desktop/project/GeoPORL/build/CMakeFiles/edit_cache.dir
+/Users/tsg/Desktop/project/GeoPORL/build/CMakeFiles/rebuild_cache.dir
